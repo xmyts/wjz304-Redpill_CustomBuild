@@ -23,10 +23,11 @@ on:
       dtbSource:
         description: 'A311D设备树来源'
         required: true
-        default: 'khadas'
+        default: 'libreelec'  # 更换为更稳定的来源
         type: choice
         options:
-        - khadas  # Khadas VIM3的A311D设备树（兼容性好）
+        - libreelec  # LibreELEC的A311D设备树（稳定性好）
+        - khadas-backup  # Khadas备份源
         - emuelec  # EmuELEC项目的A311D设备树
         - custom  # 自定义设备树
 
@@ -106,26 +107,51 @@ jobs:
           cd workdir
           echo "WORK_DIR=$(pwd)" >> $GITHUB_ENV
 
-      - name: 获取A311D设备树（修复路径问题）
+      - name: 获取A311D设备树（多重备份源）
         run: |
           cd $WORK_DIR/dtb
           
-          # 根据选择获取不同来源的设备树（优化下载方式）
-          if [ "${{ inputs.dtbSource }}" = "khadas" ]; then
-            # 直接下载Khadas VIM3的A311D设备树（避免克隆整个仓库）
-            wget https://raw.githubusercontent.com/khadas/linux/khadas-vims-5.4.y/arch/arm64/boot/dts/amlogic/meson-g12b-a311d-khadas-vim3.dts -O a311d.dts
+          # 定义设备树URL列表（按优先级排序）
+          LIBREELEC_DTB_URL="https://raw.githubusercontent.com/LibreELEC/LibreELEC.tv/master/projects/Amlogic-ng/device-trees/meson-g12b-a311d-khadas-vim3.dts"
+          KHADAS_BACKUP_URL="https://raw.githubusercontent.com/khadas/linux/khadas-vim3-5.4.y/arch/arm64/boot/dts/amlogic/meson-g12b-a311d-khadas-vim3.dts"
+          EMUELEC_DTB_URL="https://raw.githubusercontent.com/EmuELEC/EmuELEC/main/device_trees/a311d.dtb"
+          
+          # 根据选择获取不同来源的设备树
+          if [ "${{ inputs.dtbSource }}" = "libreelec" ]; then
+            echo "尝试从LibreELEC获取设备树..."
+            wget --no-check-certificate "$LIBREELEC_DTB_URL" -O a311d.dts || {
+              echo "LibreELEC源失败，尝试Khadas备份源..."
+              wget --no-check-certificate "$KHADAS_BACKUP_URL" -O a311d.dts || {
+                echo "所有源失败，使用EmuELEC的DTB转换..."
+                wget --no-check-certificate "$EMUELEC_DTB_URL" -O a311d.dtb
+                dtc -I dtb -O dts a311d.dtb -o a311d.dts
+              }
+            }
+          elif [ "${{ inputs.dtbSource }}" = "khadas-backup" ]; then
+            echo "尝试从Khadas备份源获取设备树..."
+            wget --no-check-certificate "$KHADAS_BACKUP_URL" -O a311d.dts || {
+              echo "Khadas备份源失败，尝试LibreELEC源..."
+              wget --no-check-certificate "$LIBREELEC_DTB_URL" -O a311d.dts
+            }
           elif [ "${{ inputs.dtbSource }}" = "emuelec" ]; then
-            # EmuELEC的A311D设备树
-            wget https://raw.githubusercontent.com/EmuELEC/EmuELEC/main/device_trees/a311d.dtb
+            # 直接使用EmuELEC的DTB文件
+            wget --no-check-certificate "$EMUELEC_DTB_URL" -O a311d.dtb
             dtc -I dtb -O dts a311d.dtb -o a311d.dts
           else
             # 自定义设备树
-            wget ${{ inputs.customDtbUrl }} -O a311d.dts
+            if [ -z "${{ inputs.customDtbUrl }}" ]; then
+              echo "错误：自定义设备树URL不能为空！"
+              exit 1
+            fi
+            wget --no-check-certificate "${{ inputs.customDtbUrl }}" -O a311d.dts || {
+              echo "自定义设备树下载失败！"
+              exit 1
+            }
           fi
           
           # 验证设备树文件是否存在
-          if [ ! -f "a311d.dts" ]; then
-            echo "错误：设备树文件下载失败！"
+          if [ ! -f "a311d.dts" ] || [ ! -s "a311d.dts" ]; then
+            echo "错误：设备树文件获取失败或为空！"
             exit 1
           fi
           
@@ -133,41 +159,61 @@ jobs:
           # 启用必要的外设和接口
           sed -i 's/#define SATA_PORT_COUNT 0/#define SATA_PORT_COUNT 4/g' a311d.dts
           sed -i '/usb/{s/disabled; //g}' a311d.dts
+          sed -i '/ethernet/{s/status = "disabled";/status = "okay";/g}' a311d.dts
           
           # 编译设备树
           dtc -I dts -O dtb -o a311d.dtb a311d.dts
+          if [ $? -ne 0 ]; then
+            echo "错误：设备树编译失败！"
+            exit 1
+          fi
           ls -l
 
-      - name: 获取A311D专用驱动（优化下载）
+      - name: 获取A311D专用驱动
         run: |
           cd $WORK_DIR/drivers
           
-          # 直接下载预编译驱动或精简仓库克隆
+          # 使用精简克隆方式获取驱动源码
           git clone --depth 1 --single-branch --branch amlogic-5.4 https://github.com/chewitt/linux.git -n
           cd linux
-          # 只检出驱动所需目录，大幅减少下载量
           git sparse-checkout init --cone
           git sparse-checkout set drivers/usb/storage drivers/net/ethernet/realtek drivers/usb/uas
-          git checkout
+          git checkout || {
+            echo "驱动仓库克隆失败，使用备用源..."
+            # 备用源：直接下载预编译驱动
+            wget https://github.com/ophub/kernel/tree/main/patch/drivers/usb/storage/usb-storage.ko -O ../usb-storage.ko
+            wget https://github.com/ophub/kernel/tree/main/patch/drivers/net/ethernet/realtek/r8152.ko -O ../r8152.ko
+            wget https://github.com/ophub/kernel/tree/main/patch/drivers/net/ethernet/realtek/r8169.ko -O ../r8169.ko
+            wget https://github.com/ophub/kernel/tree/main/patch/drivers/usb/uas/uas.ko -O ../uas.ko
+          }
           
-          # 编译A311D需要的驱动
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          
-          # 编译USB转SATA驱动
-          make -C . M=drivers/usb/storage/ modules
-          cp drivers/usb/storage/usb-storage.ko ../
-          
-          # 编译Realtek网卡驱动
-          make -C . M=drivers/net/ethernet/realtek/ modules
-          cp drivers/net/ethernet/realtek/r8152.ko ../
-          cp drivers/net/ethernet/realtek/r8169.ko ../
-          
-          # 编译UAS驱动
-          make -C . M=drivers/usb/uas/ modules
-          cp drivers/usb/uas/uas.ko ../
+          # 如果源码可用则编译驱动
+          if [ -d "drivers/usb/storage" ]; then
+            export ARCH=arm64
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            
+            # 编译USB转SATA驱动
+            make -C . M=drivers/usb/storage/ modules
+            cp drivers/usb/storage/usb-storage.ko ../
+            
+            # 编译Realtek网卡驱动
+            make -C . M=drivers/net/ethernet/realtek/ modules
+            cp drivers/net/ethernet/realtek/r8152.ko ../
+            cp drivers/net/ethernet/realtek/r8169.ko ../
+            
+            # 编译UAS驱动
+            make -C . M=drivers/usb/uas/ modules
+            cp drivers/usb/uas/uas.ko ../
+          fi
           
           cd ..
+          # 验证驱动文件
+          for driver in usb-storage.ko r8152.ko r8169.ko uas.ko; do
+            if [ ! -f "$driver" ] || [ ! -s "$driver" ]; then
+              echo "错误：驱动文件 $driver 缺失！"
+              exit 1
+            fi
+          done
           ls -l *.ko
 
       - name: 下载并处理DSM固件
@@ -176,13 +222,19 @@ jobs:
           
           # 下载DS423固件
           if [ "${{ inputs.dsmVersion }}" = "7.2.0-72806" ]; then
-            wget https://global.download.synology.com/download/DSM/release/7.2/72806/DSM_DS423_72806.pat -O ds423.pat
+            wget https://global.download.synology.com/download/DSM/release/7.2/72806/DSM_DS423_72806.pat -O ds423.pat || {
+              echo "主源下载失败，尝试备用源..."
+              wget https://archive.synology.com/download/DSM/release/7.2/72806/DSM_DS423_72806.pat -O ds423.pat
+            }
           else
-            wget https://global.download.synology.com/download/DSM/release/7.1/42661/DSM_DS423_42661.pat -O ds423.pat
+            wget https://global.download.synology.com/download/DSM/release/7.1/42661/DSM_DS423_42661.pat -O ds423.pat || {
+              echo "主源下载失败，尝试备用源..."
+              wget https://archive.synology.com/download/DSM/release/7.1/42661/DSM_DS423_42661.pat -O ds423.pat
+            }
           fi
           
           # 验证固件文件
-          if [ ! -f "ds423.pat" ]; then
+          if [ ! -f "ds423.pat" ] || [ ! -s "ds423.pat" ]; then
             echo "错误：DSM固件下载失败！"
             exit 1
           fi
@@ -195,31 +247,42 @@ jobs:
           from Crypto.Cipher import AES
           import zlib
           
-          # 解密PAT文件
-          with open("../ds423.pat", "rb") as f:
-              data = f.read()
-          
-          # 提取加密部分 (Synology PAT格式处理)
-          header = data[:0x200]
-          encrypted_data = data[0x200:]
-          
-          # 使用默认密钥解密 (公开信息)
-          key = b"\x23\x31\x34\x6C\x6A\x4E\x56\x4A\x55\x38\x52\x78\x43\x6A\x67\x45"
-          iv = b"\x00" * 16
-          cipher = AES.new(key, AES.MODE_CBC, iv)
-          decrypted = cipher.decrypt(encrypted_data)
-          
-          # 解压
-          decompressed = zlib.decompress(decrypted)
-          
-          with open("dsm_raw.img", "wb") as f:
-              f.write(decompressed)
+          try:
+              # 解密PAT文件
+              with open("../ds423.pat", "rb") as f:
+                  data = f.read()
+              
+              # 提取加密部分 (Synology PAT格式处理)
+              header = data[:0x200]
+              encrypted_data = data[0x200:]
+              
+              # 使用默认密钥解密 (公开信息)
+              key = b"\x23\x31\x34\x6C\x6A\x4E\x56\x4A\x55\x38\x52\x78\x43\x6A\x67\x45"
+              iv = b"\x00" * 16
+              cipher = AES.new(key, AES.MODE_CBC, iv)
+              decrypted = cipher.decrypt(encrypted_data)
+              
+              # 解压
+              decompressed = zlib.decompress(decrypted)
+              
+              with open("dsm_raw.img", "wb") as f:
+                  f.write(decompressed)
+                  
+          except Exception as e:
+              print(f"固件处理错误: {str(e)}")
+              exit(1)
           '
           
           # 挂载并提取内核和根文件系统
           mkdir mnt
-          sudo mount -o loop,offset=1048576 dsm_raw.img mnt
-          cp mnt/boot/vmlinuz-* $WORK_DIR/output/kernel
+          if ! sudo mount -o loop,offset=1048576 dsm_raw.img mnt; then
+            echo "错误：挂载DSM镜像失败！"
+            exit 1
+          fi
+          cp mnt/boot/vmlinuz-* $WORK_DIR/output/kernel || {
+            echo "错误：提取内核失败！"
+            exit 1
+          }
           cp -r mnt/* $WORK_DIR/output/rootfs
           sudo umount mnt
 
@@ -228,7 +291,10 @@ jobs:
           cd $WORK_DIR/src
           
           # 克隆ARM64版本的redpill-load
-          git clone --depth 1 -b arm64 https://github.com/pocopico/redpill-load.git
+          git clone --depth 1 -b arm64 https://github.com/pocopico/redpill-load.git || {
+            echo "redpill-load克隆失败，尝试备用仓库..."
+            git clone --depth 1 -b arm64 https://github.com/RedPill-TTG/redpill-load.git
+          }
           cd redpill-load
           
           # 配置用户参数
@@ -262,11 +328,16 @@ jobs:
           # 添加额外驱动
           IFS=',' read -ra DRIVERS <<< "${{ inputs.extraDrivers }}"
           for driver in "${DRIVERS[@]}"; do
-            ./ext-manager.sh add "https://raw.githubusercontent.com/pocopico/rp-ext/master/${driver}/rpext-index.json"
+            ./ext-manager.sh add "https://raw.githubusercontent.com/pocopico/rp-ext/master/${driver}/rpext-index.json" || {
+              echo "警告：驱动 $driver 添加失败，继续执行..."
+            }
           done
           
           # 编译ARM64引导镜像
-          sudo BRP_JUN_MOD=0 BRP_DEBUG=1 BRP_USER_CFG=user_config.json ./build-loader.sh "DS423" "${{ inputs.dsmVersion }}"
+          sudo BRP_JUN_MOD=0 BRP_DEBUG=1 BRP_USER_CFG=user_config.json ./build-loader.sh "DS423" "${{ inputs.dsmVersion }}" || {
+            echo "错误：引导镜像编译失败！"
+            exit 1
+          }
           
           # 复制生成的镜像
           cp images/*.img $WORK_DIR/output/
@@ -292,8 +363,10 @@ jobs:
           mkdir -p mnt
           sudo mount ${LOOP_DEV}p1 mnt
           
-          # 复制U-Boot和启动文件
-          wget https://github.com/khadas/u-boot/raw/master/build/u-boot.bin -O mnt/u-boot.bin
+          # 复制U-Boot（使用备用源）
+          wget https://github.com/khadas/u-boot/releases/download/v2021.07/u-boot.bin -O mnt/u-boot.bin || {
+            wget https://github.com/ophub/u-boot/raw/main/output/u-boot.bin -O mnt/u-boot.bin
+          }
           
           # 复制内核和设备树
           cp kernel mnt/zImage
