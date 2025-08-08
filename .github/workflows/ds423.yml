@@ -1,0 +1,310 @@
+name: A311D DS423 引导生成器
+on:
+  workflow_dispatch:
+    inputs:
+      targetDevice:
+        description: '目标设备'
+        required: true
+        default: 'a311d'
+        type: choice
+        options:
+        - a311d  # 晶晨A311D芯片设备（如网心云盒子）
+        - ds423  # 原生DS423设备
+
+      dsmVersion:
+        description: 'DSM版本'
+        required: true
+        default: '7.2.0-72806'
+        type: choice
+        options:
+        - 7.2.0-72806
+        - 7.1.0-42661
+
+      dtbSource:
+        description: 'A311D设备树来源'
+        required: true
+        default: 'khadas'
+        type: choice
+        options:
+        - khadas  # Khadas VIM3的A311D设备树（兼容性好）
+        - emuelec  # EmuELEC项目的A311D设备树
+        - custom  # 自定义设备树
+
+      customDtbUrl:
+        description: '自定义设备树URL（仅当dtbSource为custom时需要）'
+        required: false
+        default: ''
+        type: string
+
+      sataPortMap:
+        description: 'SATA端口映射（A311D通常为USB转SATA）'
+        required: true
+        default: '4'
+        type: string
+
+      diskIdxMap:
+        description: '磁盘索引映射'
+        required: true
+        default: '0000'
+        type: string
+
+      sn:
+        description: '序列号（留空自动生成）'
+        required: false
+        default: ''
+        type: string
+
+      macAddress:
+        description: 'MAC地址（留空自动生成）'
+        required: false
+        default: ''
+        type: string
+
+      extraDrivers:
+        description: '额外驱动（逗号分隔）'
+        required: false
+        default: 'r8152,rtl8169,uas'
+        type: string
+
+jobs:
+  build-a311d-boot:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检查环境
+        run: |
+          uname -a
+          lsb_release -a
+
+      - name: 安装依赖工具
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            device-tree-compiler \
+            git \
+            wget \
+            curl \
+            xz-utils \
+            zip \
+            unzip \
+            parted \
+            mtools \
+            dosfstools \
+            u-boot-tools \
+            python3 \
+            python3-pip \
+            libssl-dev \
+            cryptsetup
+          
+          # 安装Python依赖
+          pip3 install pycryptodome requests
+
+      - name: 准备工作目录
+        run: |
+          mkdir -p workdir/{src,tools,output,dtb,drivers}
+          cd workdir
+          echo "WORK_DIR=$(pwd)" >> $GITHUB_ENV
+
+      - name: 获取A311D设备树
+        run: |
+          cd $WORK_DIR/dtb
+          
+          # 根据选择获取不同来源的设备树
+          if [ "${{ inputs.dtbSource }}" = "khadas" ]; then
+            # Khadas VIM3的A311D设备树（兼容性好）
+            git clone --depth 1 https://github.com/khadas/linux.git
+            cp linux/arch/arm64/boot/dts/amlogic/meson-g12b-a311d-khadas-vim3.dts ./a311d.dts
+          elif [ "${{ inputs.dtbSource }}" = "emuelec" ]; then
+            # EmuELEC的A311D设备树
+            wget https://raw.githubusercontent.com/EmuELEC/EmuELEC/main/device_trees/a311d.dtb
+            dtc -I dtb -O dts a311d.dtb -o a311d.dts
+          else
+            # 自定义设备树
+            wget ${{ inputs.customDtbUrl }} -O a311d.dts
+          fi
+          
+          # 针对群晖进行设备树调整
+          # 启用必要的外设和接口
+          sed -i 's/#define SATA_PORT_COUNT 0/#define SATA_PORT_COUNT 4/g' a311d.dts
+          sed -i '/usb/{s/disabled; //g}' a311d.dts
+          
+          # 编译设备树
+          dtc -I dts -O dtb -o a311d.dtb a311d.dts
+          ls -l
+
+      - name: 获取A311D专用驱动
+        run: |
+          cd $WORK_DIR/drivers
+          
+          # 克隆Amlogic驱动仓库
+          git clone --depth 1 https://github.com/chewitt/linux.git -b amlogic-5.4
+          
+          # 编译A311D需要的驱动
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # 编译USB转SATA驱动
+          make -C linux M=drivers/usb/storage/ modules
+          cp linux/drivers/usb/storage/usb-storage.ko ./
+          
+          # 编译Realtek网卡驱动
+          make -C linux M=drivers/net/ethernet/realtek/ modules
+          cp linux/drivers/net/ethernet/realtek/r8152.ko ./
+          cp linux/drivers/net/ethernet/realtek/r8169.ko ./
+          
+          # 编译UAS驱动
+          make -C linux M=drivers/usb/uas/ modules
+          cp linux/drivers/usb/uas/uas.ko ./
+          
+          ls -l *.ko
+
+      - name: 下载并处理DSM固件
+        run: |
+          cd $WORK_DIR/src
+          
+          # 下载DS423固件
+          if [ "${{ inputs.dsmVersion }}" = "7.2.0-72806" ]; then
+            wget https://global.download.synology.com/download/DSM/release/7.2/72806/DSM_DS423_72806.pat -O ds423.pat
+          else
+            wget https://global.download.synology.com/download/DSM/release/7.1/42661/DSM_DS423_42661.pat -O ds423.pat
+          fi
+          
+          # 提取固件内容
+          mkdir dsm_extract
+          cd dsm_extract
+          python3 -c '
+          import os
+          from Crypto.Cipher import AES
+          import zlib
+          
+          # 解密PAT文件
+          with open("../ds423.pat", "rb") as f:
+              data = f.read()
+          
+          # 提取加密部分 (Synology PAT格式处理)
+          header = data[:0x200]
+          encrypted_data = data[0x200:]
+          
+          # 使用默认密钥解密 (公开信息)
+          key = b"\x23\x31\x34\x6C\x6A\x4E\x56\x4A\x55\x38\x52\x78\x43\x6A\x67\x45"
+          iv = b"\x00" * 16
+          cipher = AES.new(key, AES.MODE_CBC, iv)
+          decrypted = cipher.decrypt(encrypted_data)
+          
+          # 解压
+          decompressed = zlib.decompress(decrypted)
+          
+          with open("dsm_raw.img", "wb") as f:
+              f.write(decompressed)
+          '
+          
+          # 挂载并提取内核和根文件系统
+          mkdir mnt
+          sudo mount -o loop,offset=1048576 dsm_raw.img mnt
+          cp mnt/boot/vmlinuz-* $WORK_DIR/output/kernel
+          cp -r mnt/* $WORK_DIR/output/rootfs
+          sudo umount mnt
+
+      - name: 构建Redpill引导
+        run: |
+          cd $WORK_DIR/src
+          
+          # 克隆ARM64版本的redpill-load
+          git clone --depth 1 -b arm64 https://github.com/pocopico/redpill-load.git
+          cd redpill-load
+          
+          # 配置用户参数
+          cat > user_config.json << EOF
+          {
+            "platform": "DS423",
+            "version": "${{ inputs.dsmVersion }}",
+            "extra_cmdline": {
+              "sn": "${{ inputs.sn || '1980PDN002189' }}",
+              "mac1": "${{ inputs.macAddress || '001132FA6CD3' }}",
+              "SataPortMap": "${{ inputs.sataPortMap }}",
+              "DiskIdxMap": "${{ inputs.diskIdxMap }}",
+              "console": "ttyAML0,115200n8",
+              "earlycon": "aml-uart,0xff803000"
+            },
+            "synoinfo": {
+              "internalportcfg": "0xffff",
+              "maxlanport": "2"
+            }
+          }
+          EOF
+          
+          # 添加A311D设备树
+          mkdir -p custom/dtb
+          cp $WORK_DIR/dtb/a311d.dtb custom/dtb/
+          
+          # 添加驱动
+          mkdir -p ext/drivers
+          cp $WORK_DIR/drivers/*.ko ext/drivers/
+          
+          # 添加额外驱动
+          IFS=',' read -ra DRIVERS <<< "${{ inputs.extraDrivers }}"
+          for driver in "${DRIVERS[@]}"; do
+            ./ext-manager.sh add "https://raw.githubusercontent.com/pocopico/rp-ext/master/${driver}/rpext-index.json"
+          done
+          
+          # 编译ARM64引导镜像
+          sudo BRP_JUN_MOD=0 BRP_DEBUG=1 BRP_USER_CFG=user_config.json ./build-loader.sh "DS423" "${{ inputs.dsmVersion }}"
+          
+          # 复制生成的镜像
+          cp images/*.img $WORK_DIR/output/
+
+      - name: 生成可启动镜像
+        run: |
+          cd $WORK_DIR/output
+          
+          # 创建A311D专用启动镜像
+          dd if=/dev/zero of=a311d-ds423-boot.img bs=1M count=512
+          
+          # 分区
+          parted -s a311d-ds423-boot.img mklabel gpt
+          parted -s a311d-ds423-boot.img mkpart primary fat32 4MB 512MB
+          parted -s a311d-ds423-boot.img set 1 boot on
+          
+          # 格式化
+          losetup -fP --show a311d-ds423-boot.img > loopdev.txt
+          LOOP_DEV=$(cat loopdev.txt)
+          sudo mkfs.vfat ${LOOP_DEV}p1
+          
+          # 挂载并复制文件
+          mkdir -p mnt
+          sudo mount ${LOOP_DEV}p1 mnt
+          
+          # 复制U-Boot和启动文件
+          wget https://github.com/khadas/u-boot/raw/master/build/u-boot.bin -O mnt/u-boot.bin
+          
+          # 复制内核和设备树
+          cp kernel mnt/zImage
+          cp $WORK_DIR/dtb/a311d.dtb mnt/dtb.img
+          
+          # 复制Redpill引导文件
+          cp *.img mnt/
+          
+          # 创建启动脚本
+          cat > mnt/boot.scr << EOF
+          #!/bin/bash
+          setenv bootargs "console=ttyAML0,115200n8 root=/dev/sda1 rw rootwait SataPortMap=${{ inputs.sataPortMap }} DiskIdxMap=${{ inputs.diskIdxMap }}"
+          load mmc 0:1 0x1080000 zImage
+          load mmc 0:1 0x2000000 dtb.img
+          bootz 0x1080000 - 0x2000000
+          EOF
+          mkimage -A arm64 -O linux -T script -C none -a 0 -e 0 -n "A311D DS423 Boot Script" -d mnt/boot.scr mnt/boot.scr.uimg
+          
+          # 清理
+          sudo umount mnt
+          losetup -d ${LOOP_DEV}
+          rm loopdev.txt
+          
+          # 压缩输出
+          zip -r a311d-ds423-boot-${{ inputs.dsmVersion }}.zip a311d-ds423-boot.img
+
+      - name: 上传结果
+        uses: actions/upload-artifact@v3
+        with:
+          name: a311d-ds423-boot-image
+          path: ${{ env.WORK_DIR }}/output/*.zip
