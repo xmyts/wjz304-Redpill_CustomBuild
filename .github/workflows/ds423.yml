@@ -304,7 +304,9 @@ jobs:
           zip -r a311d-ds423-boot-${{ inputs.dsmVersion }}.zip a311d-ds423-boot.img
 
       - name: 上传结果
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # 已升级到最新v4版本
         with:
-          name: a311d-ds423-boot-image
+          name: a311d-ds423-boot-image-${{ github.run_id }}  # 添加唯一ID避免冲突
           path: ${{ env.WORK_DIR }}/output/*.zip
+          if-no-files-found: error  # 无文件时抛出错误
+          retention-days: 30  # 保留30天
