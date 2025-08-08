@@ -106,15 +106,14 @@ jobs:
           cd workdir
           echo "WORK_DIR=$(pwd)" >> $GITHUB_ENV
 
-      - name: 获取A311D设备树
+      - name: 获取A311D设备树（修复路径问题）
         run: |
           cd $WORK_DIR/dtb
           
-          # 根据选择获取不同来源的设备树
+          # 根据选择获取不同来源的设备树（优化下载方式）
           if [ "${{ inputs.dtbSource }}" = "khadas" ]; then
-            # Khadas VIM3的A311D设备树（兼容性好）
-            git clone --depth 1 https://github.com/khadas/linux.git
-            cp linux/arch/arm64/boot/dts/amlogic/meson-g12b-a311d-khadas-vim3.dts ./a311d.dts
+            # 直接下载Khadas VIM3的A311D设备树（避免克隆整个仓库）
+            wget https://raw.githubusercontent.com/khadas/linux/khadas-vims-5.4.y/arch/arm64/boot/dts/amlogic/meson-g12b-a311d-khadas-vim3.dts -O a311d.dts
           elif [ "${{ inputs.dtbSource }}" = "emuelec" ]; then
             # EmuELEC的A311D设备树
             wget https://raw.githubusercontent.com/EmuELEC/EmuELEC/main/device_trees/a311d.dtb
@@ -122,6 +121,12 @@ jobs:
           else
             # 自定义设备树
             wget ${{ inputs.customDtbUrl }} -O a311d.dts
+          fi
+          
+          # 验证设备树文件是否存在
+          if [ ! -f "a311d.dts" ]; then
+            echo "错误：设备树文件下载失败！"
+            exit 1
           fi
           
           # 针对群晖进行设备树调整
@@ -133,30 +138,36 @@ jobs:
           dtc -I dts -O dtb -o a311d.dtb a311d.dts
           ls -l
 
-      - name: 获取A311D专用驱动
+      - name: 获取A311D专用驱动（优化下载）
         run: |
           cd $WORK_DIR/drivers
           
-          # 克隆Amlogic驱动仓库
-          git clone --depth 1 https://github.com/chewitt/linux.git -b amlogic-5.4
+          # 直接下载预编译驱动或精简仓库克隆
+          git clone --depth 1 --single-branch --branch amlogic-5.4 https://github.com/chewitt/linux.git -n
+          cd linux
+          # 只检出驱动所需目录，大幅减少下载量
+          git sparse-checkout init --cone
+          git sparse-checkout set drivers/usb/storage drivers/net/ethernet/realtek drivers/usb/uas
+          git checkout
           
           # 编译A311D需要的驱动
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
           # 编译USB转SATA驱动
-          make -C linux M=drivers/usb/storage/ modules
-          cp linux/drivers/usb/storage/usb-storage.ko ./
+          make -C . M=drivers/usb/storage/ modules
+          cp drivers/usb/storage/usb-storage.ko ../
           
           # 编译Realtek网卡驱动
-          make -C linux M=drivers/net/ethernet/realtek/ modules
-          cp linux/drivers/net/ethernet/realtek/r8152.ko ./
-          cp linux/drivers/net/ethernet/realtek/r8169.ko ./
+          make -C . M=drivers/net/ethernet/realtek/ modules
+          cp drivers/net/ethernet/realtek/r8152.ko ../
+          cp drivers/net/ethernet/realtek/r8169.ko ../
           
           # 编译UAS驱动
-          make -C linux M=drivers/usb/uas/ modules
-          cp linux/drivers/usb/uas/uas.ko ./
+          make -C . M=drivers/usb/uas/ modules
+          cp drivers/usb/uas/uas.ko ../
           
+          cd ..
           ls -l *.ko
 
       - name: 下载并处理DSM固件
@@ -168,6 +179,12 @@ jobs:
             wget https://global.download.synology.com/download/DSM/release/7.2/72806/DSM_DS423_72806.pat -O ds423.pat
           else
             wget https://global.download.synology.com/download/DSM/release/7.1/42661/DSM_DS423_42661.pat -O ds423.pat
+          fi
+          
+          # 验证固件文件
+          if [ ! -f "ds423.pat" ]; then
+            echo "错误：DSM固件下载失败！"
+            exit 1
           fi
           
           # 提取固件内容
@@ -304,9 +321,9 @@ jobs:
           zip -r a311d-ds423-boot-${{ inputs.dsmVersion }}.zip a311d-ds423-boot.img
 
       - name: 上传结果
-        uses: actions/upload-artifact@v4  # 已升级到最新v4版本
+        uses: actions/upload-artifact@v4
         with:
-          name: a311d-ds423-boot-image-${{ github.run_id }}  # 添加唯一ID避免冲突
+          name: a311d-ds423-boot-image-${{ github.run_id }}
           path: ${{ env.WORK_DIR }}/output/*.zip
-          if-no-files-found: error  # 无文件时抛出错误
-          retention-days: 30  # 保留30天
+          if-no-files-found: error
+          retention-days: 30
